@@ -11,7 +11,7 @@ use std::fs;
 use std::hash::{Hash, Hasher};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, ExitStatus};
 use std::str;
 
 use cargo_metadata::Edition;
@@ -476,6 +476,8 @@ fn run_rustfmt(
     fmt_args: &[String],
     verbosity: Verbosity,
 ) -> Result<i32, io::Error> {
+    use rayon::prelude::*;
+
     let by_edition = targets
         .iter()
         .inspect(|t| {
@@ -488,14 +490,8 @@ fn run_rustfmt(
             h
         });
 
-    let mut status = vec![];
+    let mut status: Vec<Result<ExitStatus, std::io::Error>> = vec![];
     for (edition, files) in by_edition {
-        let stdout = if verbosity == Verbosity::Quiet {
-            std::process::Stdio::null()
-        } else {
-            std::process::Stdio::inherit()
-        };
-
         if verbosity == Verbosity::Verbose {
             print!("rustfmt");
             print!(" --edition {edition}");
@@ -503,25 +499,39 @@ fn run_rustfmt(
             files.iter().for_each(|f| print!(" {}", f.display()));
             println!();
         }
+        let runners = files.par_chunks(64).map(|files| {
+            let stdout = if verbosity == Verbosity::Quiet {
+                std::process::Stdio::null()
+            } else {
+                std::process::Stdio::inherit()
+            };
 
-        let mut command = rustfmt_command()
-            .stdout(stdout)
-            .args(files)
-            .args(["--edition", edition.as_str()])
-            .args(fmt_args)
-            .spawn()
-            .map_err(|e| match e.kind() {
-                io::ErrorKind::NotFound => io::Error::new(
-                    io::ErrorKind::Other,
-                    "Could not run rustfmt, please make sure it is in your PATH.",
-                ),
-                _ => e,
-            })?;
+            let mut command = rustfmt_command()
+                .stdout(stdout)
+                .args(files)
+                .args(["--edition", edition.as_str()])
+                .args(fmt_args)
+                .spawn()
+                .map_err(|e| match e.kind() {
+                    io::ErrorKind::NotFound => io::Error::new(
+                        io::ErrorKind::Other,
+                        "Could not run rustfmt, please make sure it is in your PATH.",
+                    ),
+                    _ => e,
+                })?;
 
-        status.push(command.wait()?);
+            command.wait()
+        });
+
+        status.par_extend(runners);
+    }
+    let mut exit_statues = vec![];
+
+    for status in status {
+        exit_statues.push(status?);
     }
 
-    Ok(status
+    Ok(exit_statues
         .iter()
         .filter_map(|s| if s.success() { None } else { s.code() })
         .next()
